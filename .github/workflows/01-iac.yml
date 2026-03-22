@@ -1,0 +1,100 @@
+# =============================================================================
+# Pipeline 1 — IaC Security Scan + Terraform Plan
+#
+# PDF Requirements satisfied:
+#   REQ-22: CI/CD pipeline to securely deploy as Infrastructure-as-Code
+#   REQ-24: scan IaC code (Checkov) prior to deployment
+#   REQ-30: (optional) security in CI/CD — Checkov is the IaC security gate
+#
+# JOBS:
+#   1. checkov-scan — scans terraform/ for misconfigurations BEFORE any deploy
+#   2. terraform-plan — generates plan on PRs (shows what would change)
+#   3. terraform-apply — applies on push to main (NOTE: fails in CloudLabs
+#      because Service Principal is unavailable. Setup is done via deploy.sh.
+#      The Checkov scan — the security value — still runs successfully.)
+#
+# INTENTIONAL CHECKOV FINDINGS (expected — do not fix):
+#   All 8 intentional weak configs in terraform/main.tf will be flagged.
+#   soft_fail: true means findings are reported but don't block the run.
+# =============================================================================
+name: "Pipeline 1 — IaC Scan + Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths: ["terraform/**"]
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**"]
+  workflow_dispatch:
+
+env:
+  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+
+jobs:
+
+  # REQ-24: scan IaC before any infrastructure change
+  checkov-scan:
+    name: "Checkov IaC scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkov — scan Terraform for misconfigurations
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: cli
+          # soft_fail: intentional weak configs will produce findings
+          soft_fail: true
+
+      - name: Step summary
+        if: always()
+        run: |
+          echo "## Checkov IaC Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "Scanned \`terraform/\` for misconfigurations." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All 8 intentional weak configs are expected findings." >> $GITHUB_STEP_SUMMARY
+
+  terraform-plan:
+    name: "Terraform plan"
+    needs: checkov-scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.7"
+      - run: terraform init -input=false
+        working-directory: terraform/
+      - run: |
+          terraform plan \
+            -var="vm_ssh_public_key=${{ secrets.VM_SSH_PUBLIC_KEY }}" \
+            -var="your_name=${{ secrets.CANDIDATE_NAME }}" \
+            -input=false -no-color
+        working-directory: terraform/
+
+  terraform-apply:
+    name: "Terraform apply"
+    needs: checkov-scan
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.7"
+      - run: terraform init -input=false
+        working-directory: terraform/
+      - run: |
+          terraform apply \
+            -var="vm_ssh_public_key=${{ secrets.VM_SSH_PUBLIC_KEY }}" \
+            -var="your_name=${{ secrets.CANDIDATE_NAME }}" \
+            -auto-approve -input=false
+        working-directory: terraform/

@@ -1,0 +1,12 @@
+# Terraform — state, secrets and provider cache (can be 300MB)
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
+
+# Runtime outputs — contain IPs and resource names
+wiz-outputs.txt
+
+# Logs
+*.log

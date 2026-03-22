@@ -1,0 +1,133 @@
+# =============================================================================
+# Pipeline 2 — Container Build + Security Scan + Deploy
+#
+# PDF Requirements satisfied:
+#   REQ-23: build + push container to registry + trigger k8s deployment
+#   REQ-24: scan container image (Trivy) before pushing to registry
+#   REQ-30: (optional) security in CI/CD — Trivy is the container security gate
+#
+# JOBS:
+#   1. build         — builds the Docker image locally for scanning
+#   2. trivy-scan    — scans image for CVEs BEFORE pushing to ACR
+#   3. push-deploy   — pushes to ACR + rolls out to k3s via az run-command
+#
+# WHY az vm run-command FOR DEPLOYMENT:
+#   k3s-vm has no public IP (CloudLabs policy). We can't reach it from the
+#   GitHub Actions runner. az run-command executes kubectl inside the VM
+#   via the Azure control plane — no network access to the VM needed.
+# =============================================================================
+name: "Pipeline 2 — Container Build + Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**"]
+  workflow_dispatch:
+
+env:
+  IMAGE: todo-app
+  TAG:   ${{ github.sha }}
+
+jobs:
+
+  build:
+    name: "Build image"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build Docker image
+        working-directory: app/
+        run: |
+          docker build \
+            --build-arg CANDIDATE_NAME="${{ secrets.CANDIDATE_NAME }}" \
+            --tag "${{ env.IMAGE }}:${{ env.TAG }}" \
+            .
+          docker save "${{ env.IMAGE }}:${{ env.TAG }}" -o /tmp/image.tar
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: container-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # REQ-24: scan image before pushing — findings go to GitHub Security tab
+  trivy-scan:
+    name: "Trivy container scan"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: container-image
+          path: /tmp/
+
+      - run: docker load -i /tmp/image.tar
+
+      - name: Trivy — scan for CRITICAL/HIGH CVEs
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE }}:${{ env.TAG }}"
+          format: "table"
+          exit-code: "0"       # report only — node:18-alpine has known CVEs
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+      - name: Trivy — SARIF for GitHub Security tab
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE }}:${{ env.TAG }}"
+          format: "sarif"
+          output: "trivy.sarif"
+          exit-code: "0"
+          severity: "CRITICAL,HIGH"
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy.sarif"
+
+  push-deploy:
+    name: "Push to ACR + deploy to k3s"
+    needs: [build, trivy-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: container-image
+          path: /tmp/
+
+      - run: docker load -i /tmp/image.tar
+
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Push to ACR
+        run: |
+          ACR="${{ secrets.ACR_NAME }}.azurecr.io"
+          az acr login --name "${{ secrets.ACR_NAME }}"
+          docker tag "${{ env.IMAGE }}:${{ env.TAG }}" "${ACR}/${{ env.IMAGE }}:${{ env.TAG }}"
+          docker tag "${{ env.IMAGE }}:${{ env.TAG }}" "${ACR}/${{ env.IMAGE }}:latest"
+          docker push "${ACR}/${{ env.IMAGE }}:${{ env.TAG }}"
+          docker push "${ACR}/${{ env.IMAGE }}:latest"
+          echo "ACR_IMAGE=${ACR}/${{ env.IMAGE }}:${{ env.TAG }}" >> $GITHUB_ENV
+
+      - name: Rolling deploy to k3s via az run-command
+        run: |
+          az vm run-command invoke \
+            --resource-group wiz-exercise-rg \
+            --name k3s-vm \
+            --command-id RunShellScript \
+            --scripts "
+              export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+              kubectl set image deployment/todo-app todo-app=${{ env.ACR_IMAGE }}
+              kubectl rollout status deployment/todo-app --timeout=5m
+            " \
+            --query "value[0].message" -o tsv | grep -v "^Enable succeeded"
